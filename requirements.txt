@@ -1,0 +1,7 @@
+streamlit
+feedparser
+trafilatura
+requests
+python-dateutil
+edge-tts
+libsql-client
