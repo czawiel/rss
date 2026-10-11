@@ -1,5 +1,5 @@
 # ==========================================
-# Wersja: v3.2 (Poprawka połączenia Turso HTTP)
+# Wersja: v3.3 (Zapis ustawień, filtrów i źródeł w SQL)
 # ==========================================
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from difflib import SequenceMatcher
 import html
 import io
+import json
 import re
 import sqlite3
 import time
@@ -42,11 +43,51 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# --- KANAŁY RSS ---
+FEEDS = {
+    # Wiadomości Kraj
+    "TVN24 - Polska": {"url": "https://tvn24.pl/polska.xml", "scope": "Kraj", "category": "Wiadomości", "is_foreign": False},
+    "RMF24 - Polska": {"url": "https://www.rmf24.pl/fakty/polska/feed", "scope": "Kraj", "category": "Wiadomości", "is_foreign": False},
+    "Polsat News - Kraj": {"url": "https://www.polsatnews.pl/rss/polska.xml", "scope": "Kraj", "category": "Wiadomości", "is_foreign": False},
+    "Interia - Fakty": {"url": "https://fakty.interia.pl/feed", "scope": "Kraj", "category": "Wiadomości", "is_foreign": False},
+    "Onet - Wiadomości": {"url": "https://wiadomosci.onet.pl/.feed", "scope": "Kraj", "category": "Wiadomości", "is_foreign": False},
+    "Gazeta.pl - Kraj": {"url": "https://wiadomosci.gazeta.pl/pub/rss/kraj.htm", "scope": "Kraj", "category": "Wiadomości", "is_foreign": False},
+    "Polskie Radio 24": {"url": "https://polskieradio24.pl/rss", "scope": "Kraj", "category": "Wiadomości", "is_foreign": False},
+    "Dziennik.pl - Kraj": {"url": "https://wiadomosci.dziennik.pl/rss.xml", "scope": "Kraj", "category": "Wiadomości", "is_foreign": False},
+    
+    # Biznes i Gospodarka
+    "Bankier - Wiadomości": {"url": "https://www.bankier.pl/rss/wiadomosci.xml", "scope": "Kraj", "category": "Biznes i Gospodarka", "is_foreign": False},
+    "Money.pl": {"url": "https://www.money.pl/rss/", "scope": "Kraj", "category": "Biznes i Gospodarka", "is_foreign": False},
+    "Puls Biznesu": {"url": "https://www.pb.pl/rss/", "scope": "Kraj", "category": "Biznes i Gospodarka", "is_foreign": False},
+
+    # Technologia i IT
+    "Dobreprogramy": {"url": "https://www.dobreprogramy.pl/rss/aktualnosci.xml", "scope": "Kraj", "category": "Technologia i IT", "is_foreign": False},
+    "SpidersWeb": {"url": "https://spidersweb.pl/feed", "scope": "Kraj", "category": "Technologia i IT", "is_foreign": False},
+    "Niebezpiecznik": {"url": "https://niebezpiecznik.pl/feed/", "scope": "Kraj", "category": "Technologia i IT", "is_foreign": False},
+    
+    # Motoryzacja
+    "Autokult": {"url": "https://autokult.pl/rss.xml", "scope": "Kraj", "category": "Motoryzacja", "is_foreign": False},
+
+    # Świat
+    "TVN24 - Świat": {"url": "https://tvn24.pl/swiat.xml", "scope": "Świat", "category": "Wiadomości", "is_foreign": False},
+    "RMF24 - Świat": {"url": "https://www.rmf24.pl/fakty/swiat/feed", "scope": "Świat", "category": "Wiadomości", "is_foreign": False},
+    "Polsat News - Świat": {"url": "https://www.polsatnews.pl/rss/swiat.xml", "scope": "Świat", "category": "Wiadomości", "is_foreign": False},
+    "Interia - Świat": {"url": "https://swiat.interia.pl/feed", "scope": "Świat", "category": "Wiadomości", "is_foreign": False},
+    "BBC News - World": {"url": "https://feeds.bbci.co.uk/news/world/rss.xml", "scope": "Świat", "category": "Wiadomości", "is_foreign": True},
+    "Bankier - Rynki": {"url": "https://www.bankier.pl/rss/rynki.xml", "scope": "Świat", "category": "Biznes i Gospodarka", "is_foreign": False},
+    "TechCrunch": {"url": "https://techcrunch.com/feed/", "scope": "Świat", "category": "Technologia i IT", "is_foreign": True},
+    "The Verge": {"url": "https://www.theverge.com/rss/index.xml", "scope": "Świat", "category": "Technologia i IT", "is_foreign": True},
+    "Ars Technica": {"url": "https://feeds.arstechnica.com/arstechnica/index", "scope": "Świat", "category": "Technologia i IT", "is_foreign": True},
+}
+
+ALL_SCOPES = ["Kraj", "Świat"]
+ALL_CATEGORIES = sorted(list({v["category"] for v in FEEDS.values()}))
+ALL_SOURCES = list(FEEDS.keys())
+
 # --- OBSŁUGA BAZY DANYCH: LIBSQL (HTTPS) Z FALLBACKIEM DO SQLITE ---
 DB_LOCAL = "news_saved.db"
 
 raw_url = st.secrets.get("LIBSQL_URL", "")
-# Wymuszenie protokołu HTTPS, aby wyeliminować błędy WebSockets (WSServerHandshakeError)
 if raw_url.startswith("libsql://"):
     LIBSQL_URL = raw_url.replace("libsql://", "https://")
 else:
@@ -61,7 +102,6 @@ def get_db_client():
     return None
 
 def db_execute(query: str, params: tuple = ()):
-    """Uniwersalny egzekutor zapytań dla libSQL oraz SQLite."""
     global USE_LIBSQL
     if USE_LIBSQL:
         try:
@@ -69,8 +109,7 @@ def db_execute(query: str, params: tuple = ()):
             res = client.execute(query, list(params))
             client.close()
             return res.rows
-        except Exception as e:
-            st.sidebar.warning(f"Błąd Turso Cloud: {e}. Przełączam na SQLite.")
+        except Exception:
             USE_LIBSQL = False
 
     with sqlite3.connect(DB_LOCAL) as conn:
@@ -104,16 +143,26 @@ def init_db():
 
 init_db()
 
-def get_saved_keywords() -> str:
-    default_kw = "sztuczna inteligencja, AI, paliw, stopy procentowe"
-    rows = db_execute("SELECT setting_value FROM app_settings WHERE setting_key = 'hot_keywords'")
-    return rows[0][0] if rows else default_kw
+# --- FUNKCJE OBSŁUGI USTAWIEŃ W SQL ---
 
-def save_keywords(keywords_str: str):
+def get_db_setting(key: str, default_val):
+    rows = db_execute("SELECT setting_value FROM app_settings WHERE setting_key = ?", (key,))
+    if rows:
+        val = rows[0][0]
+        try:
+            return json.loads(val)
+        except Exception:
+            return val
+    return default_val
+
+def save_db_setting(key: str, val):
+    val_str = json.dumps(val, ensure_ascii=False) if isinstance(val, (list, dict, bool, int, float)) else str(val)
     db_execute("""
         INSERT OR REPLACE INTO app_settings (setting_key, setting_value)
-        VALUES ('hot_keywords', ?)
-    """, (keywords_str,))
+        VALUES (?, ?)
+    """, (key, val_str))
+
+# --- FUNKCJE OBSŁUGI ZAKŁADEK ---
 
 def get_saved_links() -> set[str]:
     rows = db_execute("SELECT link FROM bookmarks")
@@ -444,45 +493,6 @@ def show_article_popup(article: dict):
                 st.rerun()
 
 
-# --- KANAŁY RSS ---
-
-FEEDS = {
-    # Wiadomości Kraj
-    "TVN24 - Polska": {"url": "https://tvn24.pl/polska.xml", "scope": "Kraj", "category": "Wiadomości", "is_foreign": False},
-    "RMF24 - Polska": {"url": "https://www.rmf24.pl/fakty/polska/feed", "scope": "Kraj", "category": "Wiadomości", "is_foreign": False},
-    "Polsat News - Kraj": {"url": "https://www.polsatnews.pl/rss/polska.xml", "scope": "Kraj", "category": "Wiadomości", "is_foreign": False},
-    "Interia - Fakty": {"url": "https://fakty.interia.pl/feed", "scope": "Kraj", "category": "Wiadomości", "is_foreign": False},
-    "Onet - Wiadomości": {"url": "https://wiadomosci.onet.pl/.feed", "scope": "Kraj", "category": "Wiadomości", "is_foreign": False},
-    "Gazeta.pl - Kraj": {"url": "https://wiadomosci.gazeta.pl/pub/rss/kraj.htm", "scope": "Kraj", "category": "Wiadomości", "is_foreign": False},
-    "Polskie Radio 24": {"url": "https://polskieradio24.pl/rss", "scope": "Kraj", "category": "Wiadomości", "is_foreign": False},
-    "Dziennik.pl - Kraj": {"url": "https://wiadomosci.dziennik.pl/rss.xml", "scope": "Kraj", "category": "Wiadomości", "is_foreign": False},
-    
-    # Biznes i Gospodarka
-    "Bankier - Wiadomości": {"url": "https://www.bankier.pl/rss/wiadomosci.xml", "scope": "Kraj", "category": "Biznes i Gospodarka", "is_foreign": False},
-    "Money.pl": {"url": "https://www.money.pl/rss/", "scope": "Kraj", "category": "Biznes i Gospodarka", "is_foreign": False},
-    "Puls Biznesu": {"url": "https://www.pb.pl/rss/", "scope": "Kraj", "category": "Biznes i Gospodarka", "is_foreign": False},
-
-    # Technologia i IT
-    "Dobreprogramy": {"url": "https://www.dobreprogramy.pl/rss/aktualnosci.xml", "scope": "Kraj", "category": "Technologia i IT", "is_foreign": False},
-    "SpidersWeb": {"url": "https://spidersweb.pl/feed", "scope": "Kraj", "category": "Technologia i IT", "is_foreign": False},
-    "Niebezpiecznik": {"url": "https://niebezpiecznik.pl/feed/", "scope": "Kraj", "category": "Technologia i IT", "is_foreign": False},
-    
-    # Motoryzacja
-    "Autokult": {"url": "https://autokult.pl/rss.xml", "scope": "Kraj", "category": "Motoryzacja", "is_foreign": False},
-
-    # Świat
-    "TVN24 - Świat": {"url": "https://tvn24.pl/swiat.xml", "scope": "Świat", "category": "Wiadomości", "is_foreign": False},
-    "RMF24 - Świat": {"url": "https://www.rmf24.pl/fakty/swiat/feed", "scope": "Świat", "category": "Wiadomości", "is_foreign": False},
-    "Polsat News - Świat": {"url": "https://www.polsatnews.pl/rss/swiat.xml", "scope": "Świat", "category": "Wiadomości", "is_foreign": False},
-    "Interia - Świat": {"url": "https://swiat.interia.pl/feed", "scope": "Świat", "category": "Wiadomości", "is_foreign": False},
-    "BBC News - World": {"url": "https://feeds.bbci.co.uk/news/world/rss.xml", "scope": "Świat", "category": "Wiadomości", "is_foreign": True},
-    "Bankier - Rynki": {"url": "https://www.bankier.pl/rss/rynki.xml", "scope": "Świat", "category": "Biznes i Gospodarka", "is_foreign": False},
-    "TechCrunch": {"url": "https://techcrunch.com/feed/", "scope": "Świat", "category": "Technologia i IT", "is_foreign": True},
-    "The Verge": {"url": "https://www.theverge.com/rss/index.xml", "scope": "Świat", "category": "Technologia i IT", "is_foreign": True},
-    "Ars Technica": {"url": "https://feeds.arstechnica.com/arstechnica/index", "scope": "Świat", "category": "Technologia i IT", "is_foreign": True},
-}
-
-
 def fetch_feed(name: str, meta: dict, limit: int) -> list[dict]:
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -618,6 +628,15 @@ def render_grid(articles: list[dict], section_id: str, is_saved_tab: bool = Fals
                                 st.rerun()
 
 
+# --- ODCZYT KONFIGURACJI Z BAZY SQL DO SESJI STREAMLIT ---
+
+stored_scopes = get_db_setting("filter_scopes", ALL_SCOPES)
+stored_categories = get_db_setting("filter_categories", ALL_CATEGORIES)
+stored_sources = get_db_setting("filter_sources", ALL_SOURCES)
+stored_dedup = get_db_setting("filter_dedup", True)
+stored_news_limit = get_db_setting("filter_news_limit", 3)
+stored_keywords = get_db_setting("hot_keywords", "sztuczna inteligencja, AI, paliw, stopy procentowe")
+
 # --- INTERFEJS GŁÓWNY ---
 
 st.title("🌐 Wiadomości - bądź na bieżąco")
@@ -636,46 +655,83 @@ with st.sidebar:
 
     st.markdown("---")
 
+    # 1. Zapis opcji deduplikacji w SQL
+    def on_dedup_change():
+        save_db_setting("filter_dedup", st.session_state.dedup_checkbox)
+
     dedup_enabled = st.checkbox(
         "Grupuj podobne wiadomości (1 na temat)",
-        value=True,
+        value=stored_dedup,
+        key="dedup_checkbox",
+        on_change=on_dedup_change,
         help="Wybiera artykuł o największej liczbie znaków spośród powtarzających się tematów."
     )
 
+    # 2. Zapis wyboru zasięgu w SQL
+    def on_scopes_change():
+        save_db_setting("filter_scopes", st.session_state.scopes_input)
+
+    # Walidacja poprawności wartości początkowych
+    valid_initial_scopes = [s for s in stored_scopes if s in ALL_SCOPES] or ALL_SCOPES
     selected_scopes = st.multiselect(
         "Zasięg:", 
-        options=["Kraj", "Świat"], 
-        default=["Kraj", "Świat"]
+        options=ALL_SCOPES, 
+        default=valid_initial_scopes,
+        key="scopes_input",
+        on_change=on_scopes_change
     )
 
-    all_categories = sorted(list({v["category"] for v in FEEDS.values()}))
+    # 3. Zapis wyboru kategorii w SQL
+    def on_categories_change():
+        save_db_setting("filter_categories", st.session_state.categories_input)
+
+    valid_initial_categories = [c for c in stored_categories if c in ALL_CATEGORIES] or ALL_CATEGORIES
     selected_categories = st.multiselect(
         "Wspólne kategorie:",
-        options=all_categories,
-        default=all_categories
+        options=ALL_CATEGORIES,
+        default=valid_initial_categories,
+        key="categories_input",
+        on_change=on_categories_change
     )
 
+    # 4. Dynamiczne filtrowanie źródeł z zapisem w SQL
     matching_sources = [
         k for k, v in FEEDS.items() 
         if v["scope"] in selected_scopes and v["category"] in selected_categories
     ]
 
+    def on_sources_change():
+        save_db_setting("filter_sources", st.session_state.sources_input)
+
+    valid_initial_sources = [s for s in stored_sources if s in matching_sources]
+    if not valid_initial_sources and matching_sources:
+        valid_initial_sources = matching_sources
+
     selected_sources = st.multiselect(
         "Źródła:", 
         options=matching_sources, 
-        default=matching_sources
+        default=valid_initial_sources,
+        key="sources_input",
+        on_change=on_sources_change
     )
 
-    news_limit = st.slider("Liczba newsów z portalu:", 1, 8, 3)
+    # 5. Limit newsów
+    def on_limit_change():
+        save_db_setting("filter_news_limit", st.session_state.slider_limit)
+
+    news_limit = st.slider(
+        "Liczba newsów z portalu:", 
+        1, 8, 
+        int(stored_news_limit) if str(stored_news_limit).isdigit() else 3,
+        key="slider_limit",
+        on_change=on_limit_change
+    )
 
     st.markdown("---")
     st.subheader("🔥 Śledzone tematy (Alerty)")
 
-    stored_keywords = get_saved_keywords()
-
     def update_keywords():
-        new_val = st.session_state.keywords_input_area
-        save_keywords(new_val)
+        save_db_setting("hot_keywords", st.session_state.keywords_input_area)
 
     raw_keywords = st.text_area(
         "Słowa-klucze (rozdzielaj przecinkami):",
@@ -714,6 +770,7 @@ if selected_sources:
         if a["category"] in selected_categories
     ]
 
+    # Zastosowanie deduplikacji tematycznej z wyborem najdłuższej treści
     if dedup_enabled:
         articles = deduplicate_topics(articles)
 
