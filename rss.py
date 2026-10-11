@@ -1,5 +1,5 @@
 # ==========================================
-# Wersja: v2.5
+# Wersja: v3.1 (Obsługa libSQL / Turso + SQLite)
 # ==========================================
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -17,6 +17,13 @@ import feedparser
 import requests
 import streamlit as st
 import trafilatura
+
+# Próba zaimportowania klienta libSQL
+try:
+    import libsql_client
+    HAS_LIBSQL = True
+except ImportError:
+    HAS_LIBSQL = False
 
 st.set_page_config(
     page_title="Wiadomości - bądź na bieżąco",
@@ -37,120 +44,121 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- OBSŁUGA BAZY DANYCH SQLITE ---
-DB_FILE = "news_saved.db"
+# --- OBSŁUGA BAZY DANYCH: LIBSQL (CHMURA) Z FALLBACKIEM DO SQLITE (LOKALNIE) ---
+DB_LOCAL = "news_saved.db"
+
+LIBSQL_URL = st.secrets.get("LIBSQL_URL", "")
+LIBSQL_TOKEN = st.secrets.get("LIBSQL_TOKEN", "")
+USE_LIBSQL = bool(HAS_LIBSQL and LIBSQL_URL and LIBSQL_TOKEN)
+
+def get_db_client():
+    if USE_LIBSQL:
+        return libsql_client.create_client_sync(url=LIBSQL_URL, auth_token=LIBSQL_TOKEN)
+    return None
+
+def db_execute(query: str, params: tuple = ()):
+    """Uniwersalny egzekutor zapytań dla libSQL oraz SQLite."""
+    if USE_LIBSQL:
+        client = get_db_client()
+        res = client.execute(query, list(params))
+        client.close()
+        return res.rows
+    else:
+        with sqlite3.connect(DB_LOCAL) as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            conn.commit()
+            return cursor.fetchall()
 
 def init_db():
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS bookmarks (
-                link TEXT PRIMARY KEY,
-                source TEXT,
-                scope TEXT,
-                category TEXT,
-                title TEXT,
-                original_title TEXT,
-                published TEXT,
-                iso_timestamp TEXT,
-                is_foreign INTEGER,
-                saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        cursor.execute("PRAGMA table_info(bookmarks)")
-        existing_cols = {col[1] for col in cursor.fetchall()}
-        if "iso_timestamp" not in existing_cols:
-            cursor.execute("ALTER TABLE bookmarks ADD COLUMN iso_timestamp TEXT")
+    # 1. Tabela zakładek
+    db_execute("""
+        CREATE TABLE IF NOT EXISTS bookmarks (
+            link TEXT PRIMARY KEY,
+            source TEXT,
+            scope TEXT,
+            category TEXT,
+            title TEXT,
+            original_title TEXT,
+            published TEXT,
+            iso_timestamp TEXT,
+            is_foreign INTEGER,
+            saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS app_settings (
-                setting_key TEXT PRIMARY KEY,
-                setting_value TEXT
-            )
-        """)
-        conn.commit()
+    # 2. Tabela ustawień
+    db_execute("""
+        CREATE TABLE IF NOT EXISTS app_settings (
+            setting_key TEXT PRIMARY KEY,
+            setting_value TEXT
+        )
+    """)
 
 init_db()
 
 def get_saved_keywords() -> str:
     default_kw = "sztuczna inteligencja, AI, paliw, stopy procentowe"
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'hot_keywords'")
-        row = cursor.fetchone()
-        return row[0] if row else default_kw
+    rows = db_execute("SELECT setting_value FROM app_settings WHERE setting_key = 'hot_keywords'")
+    return rows[0][0] if rows else default_kw
 
 def save_keywords(keywords_str: str):
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT OR REPLACE INTO app_settings (setting_key, setting_value)
-            VALUES ('hot_keywords', ?)
-        """, (keywords_str,))
-        conn.commit()
+    db_execute("""
+        INSERT OR REPLACE INTO app_settings (setting_key, setting_value)
+        VALUES ('hot_keywords', ?)
+    """, (keywords_str,))
 
 def get_saved_links() -> set[str]:
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT link FROM bookmarks")
-        return {row[0] for row in cursor.fetchall()}
+    rows = db_execute("SELECT link FROM bookmarks")
+    return {r[0] for r in rows}
 
 def add_bookmark(art: dict):
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT OR IGNORE INTO bookmarks 
-            (link, source, scope, category, title, original_title, published, iso_timestamp, is_foreign)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            art["link"],
-            art["source"],
-            art["scope"],
-            art["category"],
-            art["title"],
-            art.get("original_title"),
-            art["published"],
-            art.get("iso_timestamp"),
-            1 if art.get("is_foreign") else 0
-        ))
-        conn.commit()
+    db_execute("""
+        INSERT OR IGNORE INTO bookmarks 
+        (link, source, scope, category, title, original_title, published, iso_timestamp, is_foreign)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        art["link"],
+        art["source"],
+        art["scope"],
+        art["category"],
+        art["title"],
+        art.get("original_title"),
+        art["published"],
+        art.get("iso_timestamp"),
+        1 if art.get("is_foreign") else 0
+    ))
 
 def remove_bookmark(link: str):
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM bookmarks WHERE link = ?", (link,))
-        conn.commit()
+    db_execute("DELETE FROM bookmarks WHERE link = ?", (link,))
 
 def get_all_bookmarks() -> list[dict]:
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT link, source, scope, category, title, original_title, published, iso_timestamp, is_foreign 
-            FROM bookmarks ORDER BY saved_at DESC
-        """)
-        rows = cursor.fetchall()
-        bookmarks = []
-        for r in rows:
-            dt = None
-            if r[7]:
-                try:
-                    dt = datetime.fromisoformat(r[7])
-                except Exception:
-                    pass
-            bookmarks.append({
-                "link": r[0],
-                "source": r[1],
-                "scope": r[2],
-                "category": r[3],
-                "title": r[4],
-                "original_title": r[5],
-                "published": r[6],
-                "iso_timestamp": r[7],
-                "dt": dt or datetime.min.replace(tzinfo=timezone.utc),
-                "is_foreign": bool(r[8]),
-                "content_len": len(r[4] or "")
-            })
-        return bookmarks
+    rows = db_execute("""
+        SELECT link, source, scope, category, title, original_title, published, iso_timestamp, is_foreign 
+        FROM bookmarks ORDER BY saved_at DESC
+    """)
+    bookmarks = []
+    for r in rows:
+        dt = None
+        if r[7]:
+            try:
+                dt = datetime.fromisoformat(r[7])
+            except Exception:
+                pass
+        bookmarks.append({
+            "link": r[0],
+            "source": r[1],
+            "scope": r[2],
+            "category": r[3],
+            "title": r[4],
+            "original_title": r[5],
+            "published": r[6],
+            "iso_timestamp": r[7],
+            "dt": dt or datetime.min.replace(tzinfo=timezone.utc),
+            "is_foreign": bool(r[8]),
+            "content_len": len(r[4] or "")
+        })
+    return bookmarks
 
 
 # --- NIEZAWODNY SYSTEM TŁUMACZEŃ ---
@@ -358,7 +366,6 @@ def deduplicate_topics(articles: list[dict]) -> list[dict]:
             best_art["duplicate_count"] = 0
             selected_articles.append(best_art)
         else:
-            # Gdy jest duplikat na ten sam temat, pobieramy faktyczną długość tekstu
             for c_art in cluster:
                 if c_art.get("content_len", 0) <= 200:
                     real_len = fetch_raw_content_length(c_art["link"])
@@ -576,7 +583,6 @@ def render_grid(articles: list[dict], section_id: str, is_saved_tab: bool = Fals
                         show_article_popup(art)
 
                 with c2:
-                    # Automatyczny link tłumaczący całą stronę dla serwisów zagranicznych
                     source_url = get_translated_source_url(art["link"], art.get("is_foreign", False))
                     btn_label = "🔗 Źródło (PL) ↗" if art.get("is_foreign") else "🔗 Źródło ↗"
                     st.link_button(btn_label, source_url, use_container_width=True)
@@ -614,6 +620,12 @@ st.title("🌐 Wiadomości - bądź na bieżąco")
 
 with st.sidebar:
     st.header("⚙️ Ustawienia")
+
+    # Informacja o typie bazy danych
+    if USE_LIBSQL:
+        st.success("☁️ Połączono z chmurą **Turso (libSQL)**")
+    else:
+        st.info("💾 Używasz lokalnej bazy **SQLite**")
 
     # 1. Główny przycisk odświeżania na samej górze
     if st.button("🔄 Odśwież", type="primary", use_container_width=True):
