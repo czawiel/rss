@@ -1,5 +1,5 @@
 # ==========================================
-# Wersja: v3.1 (Obsługa libSQL / Turso + SQLite)
+# Wersja: v3.2 (Poprawka połączenia Turso HTTP)
 # ==========================================
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -18,7 +18,6 @@ import requests
 import streamlit as st
 import trafilatura
 
-# Próba zaimportowania klienta libSQL
 try:
     import libsql_client
     HAS_LIBSQL = True
@@ -31,7 +30,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# Styl CSS powiększający główny przycisk w pasku bocznym
 st.markdown("""
 <style>
     div[data-testid="stSidebar"] div.stButton > button[kind="primary"] {
@@ -44,10 +42,16 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- OBSŁUGA BAZY DANYCH: LIBSQL (CHMURA) Z FALLBACKIEM DO SQLITE (LOKALNIE) ---
+# --- OBSŁUGA BAZY DANYCH: LIBSQL (HTTPS) Z FALLBACKIEM DO SQLITE ---
 DB_LOCAL = "news_saved.db"
 
-LIBSQL_URL = st.secrets.get("LIBSQL_URL", "")
+raw_url = st.secrets.get("LIBSQL_URL", "")
+# Wymuszenie protokołu HTTPS, aby wyeliminować błędy WebSockets (WSServerHandshakeError)
+if raw_url.startswith("libsql://"):
+    LIBSQL_URL = raw_url.replace("libsql://", "https://")
+else:
+    LIBSQL_URL = raw_url
+
 LIBSQL_TOKEN = st.secrets.get("LIBSQL_TOKEN", "")
 USE_LIBSQL = bool(HAS_LIBSQL and LIBSQL_URL and LIBSQL_TOKEN)
 
@@ -58,20 +62,24 @@ def get_db_client():
 
 def db_execute(query: str, params: tuple = ()):
     """Uniwersalny egzekutor zapytań dla libSQL oraz SQLite."""
+    global USE_LIBSQL
     if USE_LIBSQL:
-        client = get_db_client()
-        res = client.execute(query, list(params))
-        client.close()
-        return res.rows
-    else:
-        with sqlite3.connect(DB_LOCAL) as conn:
-            cursor = conn.cursor()
-            cursor.execute(query, params)
-            conn.commit()
-            return cursor.fetchall()
+        try:
+            client = get_db_client()
+            res = client.execute(query, list(params))
+            client.close()
+            return res.rows
+        except Exception as e:
+            st.sidebar.warning(f"Błąd Turso Cloud: {e}. Przełączam na SQLite.")
+            USE_LIBSQL = False
+
+    with sqlite3.connect(DB_LOCAL) as conn:
+        cursor = conn.cursor()
+        cursor.execute(query, params)
+        conn.commit()
+        return cursor.fetchall()
 
 def init_db():
-    # 1. Tabela zakładek
     db_execute("""
         CREATE TABLE IF NOT EXISTS bookmarks (
             link TEXT PRIMARY KEY,
@@ -87,7 +95,6 @@ def init_db():
         )
     """)
 
-    # 2. Tabela ustawień
     db_execute("""
         CREATE TABLE IF NOT EXISTS app_settings (
             setting_key TEXT PRIMARY KEY,
@@ -209,7 +216,6 @@ def translate_to_pl(text: str) -> str:
     return cleaned
 
 def get_translated_source_url(url: str, is_foreign: bool) -> str:
-    """Dla serwisów zagranicznych zwraca link przepuszczony przez tłumacza stron."""
     if is_foreign:
         safe_url = urllib.parse.quote(url, safe="")
         return f"https://translate.google.com/translate?sl=auto&tl=pl&u={safe_url}"
@@ -286,7 +292,6 @@ def parse_datetime(raw_date_str: str, entry_parsed_tuple=None) -> tuple[datetime
 
 @st.cache_data(show_spinner=False)
 def fetch_raw_content_length(url: str) -> int:
-    """Pobiera i zlicza rzeczywistą liczbę znaków tekstu artykułu."""
     try:
         downloaded = trafilatura.fetch_url(url)
         if downloaded:
@@ -346,7 +351,6 @@ def are_same_topic(t1: str, t2: str) -> bool:
     return similarity >= 0.55
 
 def deduplicate_topics(articles: list[dict]) -> list[dict]:
-    """Grupuje wiadomości na ten sam temat i wybiera artykuł o najdłuższej treści."""
     clusters = []
 
     for art in articles:
@@ -621,34 +625,29 @@ st.title("🌐 Wiadomości - bądź na bieżąco")
 with st.sidebar:
     st.header("⚙️ Ustawienia")
 
-    # Informacja o typie bazy danych
     if USE_LIBSQL:
         st.success("☁️ Połączono z chmurą **Turso (libSQL)**")
     else:
         st.info("💾 Używasz lokalnej bazy **SQLite**")
 
-    # 1. Główny przycisk odświeżania na samej górze
     if st.button("🔄 Odśwież", type="primary", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
     st.markdown("---")
 
-    # 2. Opcja deduplikacji tematów z wyborem najdłuższej treści
     dedup_enabled = st.checkbox(
         "Grupuj podobne wiadomości (1 na temat)",
         value=True,
         help="Wybiera artykuł o największej liczbie znaków spośród powtarzających się tematów."
     )
 
-    # 3. Zasięg geograficzny
     selected_scopes = st.multiselect(
         "Zasięg:", 
         options=["Kraj", "Świat"], 
         default=["Kraj", "Świat"]
     )
 
-    # 4. Wspólne kategorie
     all_categories = sorted(list({v["category"] for v in FEEDS.values()}))
     selected_categories = st.multiselect(
         "Wspólne kategorie:",
@@ -656,7 +655,6 @@ with st.sidebar:
         default=all_categories
     )
 
-    # 5. Dynamiczne filtrowanie źródeł
     matching_sources = [
         k for k, v in FEEDS.items() 
         if v["scope"] in selected_scopes and v["category"] in selected_categories
@@ -716,7 +714,6 @@ if selected_sources:
         if a["category"] in selected_categories
     ]
 
-    # Zastosowanie deduplikacji tematycznej z wyborem najdłuższej treści
     if dedup_enabled:
         articles = deduplicate_topics(articles)
 
